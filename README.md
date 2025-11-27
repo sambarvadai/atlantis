@@ -1,4 +1,8 @@
-# Windows Troubleshooter MCP Agent
+# Troubleshooter MCP Agent - v 0.1
+
+| Version | Features |
+|--------|----------|
+| 0.1    |    Basic windows operations, Tavily search integration for bug fixes. |
 
 This project is a Windows troubleshooting agent that combines:
 
