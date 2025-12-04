@@ -4,6 +4,14 @@
 |--------|----------|
 | 0.1    |    Basic windows operations, Tavily search integration for bug fixes. |
 
+## Future Roadmap
+
+  Improve reliability, error handling, and overall robustness of agent workflows.
+  Enhance reasoning, tool selection, and context retention for more accurate responses.
+  Extend support beyond Windows to include **macOS** and **Linux**.
+  Add capabilities for log parsing, system monitoring, and proactive issue detection.
+  Implement a secure remote MCP server for controlled command execution across machines.
+
 This project is a Windows troubleshooting agent that combines:
 
 - A local **system operations server** (`system_ops_server.py`) that exposes safe, structured tools for inspecting and acting on a Windows machine.
@@ -237,5 +245,3 @@ http://127.0.0.1:9001/
 - Open `http://127.0.0.1:9001/`, describe a Windows issue, review the plan, and choose which commands to run.  
 
 All secrets (LLM keys, Tavily key, Mongo URI) are expected to be provided locally and should **not** be committed with real values.
-
-Link to Demo: https://drive.google.com/file/d/1OXKLV2hztSKGuc6rolAoLuyiz4VjTwMf/view?usp=sharing
