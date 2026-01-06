@@ -87,20 +87,43 @@ def log_session_to_mongo(document: dict[str, Any]) -> None:
         return
 
 
-def run_powershell(command: str) -> subprocess.CompletedProcess[str]:
-    """Run a PowerShell command and return the completed process."""
-    return subprocess.run(
-        [
-            "powershell",
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            command,
-        ],
-        capture_output=True,
-        text=True,
-    )
+def run_powershell(command: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
+    """
+    Run a PowerShell command and return the completed process.
+
+    A timeout is applied so that hung commands do not block the troubleshooting
+    flow forever. On timeout or unexpected failure, a synthetic CompletedProcess
+    with a non-zero return code and diagnostic stderr is returned instead of
+    raising an exception.
+    """
+    try:
+        return subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                command,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:  # type: ignore[attr-defined]
+        return subprocess.CompletedProcess(  # type: ignore[call-arg]
+            args=exc.cmd,
+            returncode=-1,
+            stdout=exc.stdout or "",
+            stderr=(exc.stderr or "") + f"\n[system_ops] Command timed out after {timeout} seconds.",
+        )
+    except Exception as exc:
+        return subprocess.CompletedProcess(  # type: ignore[call-arg]
+            args=["powershell", "-Command", command],
+            returncode=-1,
+            stdout="",
+            stderr=f"[system_ops] Failed to run PowerShell: {exc}",
+        )
 
 
 def is_command_available(command: str) -> bool:
@@ -443,6 +466,18 @@ class GPUInfoResponse(BaseModel):
     log: str
 
 
+class DownloadFileRequest(BaseModel):
+    url: str
+    target_path: Optional[str] = None
+
+
+class DownloadFileResponse(BaseModel):
+    success: bool
+    downloaded_path: Optional[str] = None
+    bytes_downloaded: int = 0
+    error: Optional[str] = None
+
+
 class FullHealthCheckResponse(BaseModel):
     success: bool
     summary: str
@@ -482,6 +517,7 @@ class ExecuteCommandsResponse(BaseModel):
     success: bool
     results: list[PerCommandResult]
     log: str
+    logging_enabled: bool = True
 
 
 def ensure_choco(allow_install: bool) -> tuple[bool, bool, str]:
@@ -1007,6 +1043,78 @@ def get_gpu_info_impl() -> GPUInfoResponse:
     )
 
 
+def download_file_impl(payload: DownloadFileRequest) -> DownloadFileResponse:
+    """
+    Download a file from the given URL to a local path using Python,
+    without invoking PowerShell.
+
+    If target_path is not provided, the file is saved into the user's
+    Downloads folder with a filename derived from the URL.
+    """
+    import pathlib
+    from urllib.parse import urlparse
+    from urllib.request import urlopen
+
+    url = payload.url.strip()
+    if not (url.lower().startswith("http://") or url.lower().startswith("https://")):
+        return DownloadFileResponse(
+            success=False,
+            downloaded_path=None,
+            bytes_downloaded=0,
+            error="Only http and https URLs are supported for download.",
+        )
+
+    try:
+        parsed = urlparse(url)
+    except Exception as exc:
+        return DownloadFileResponse(
+            success=False,
+            downloaded_path=None,
+            bytes_downloaded=0,
+            error=f"Invalid URL: {exc}",
+        )
+
+    # Determine target path
+    if payload.target_path:
+        target_path_str = os.path.expandvars(os.path.expanduser(payload.target_path))
+    else:
+        home = os.path.expandvars(os.path.expanduser("~"))
+        downloads_dir = os.path.join(home, "Downloads")
+        try:
+            os.makedirs(downloads_dir, exist_ok=True)
+        except Exception:
+            # Fall back to home if we cannot create Downloads
+            downloads_dir = home
+        name = pathlib.Path(parsed.path).name or "downloaded_file"
+        target_path_str = os.path.join(downloads_dir, name)
+
+    bytes_downloaded = 0
+    try:
+        with urlopen(url, timeout=60) as resp, open(
+            target_path_str, "wb"
+        ) as out_f:
+            while True:
+                chunk = resp.read(8192)
+                if not chunk:
+                    break
+                out_f.write(chunk)
+                bytes_downloaded += len(chunk)
+    except Exception as exc:
+        return DownloadFileResponse(
+            success=False,
+            downloaded_path=None,
+            bytes_downloaded=bytes_downloaded,
+            error=f"Download failed: {exc}",
+        )
+
+    return DownloadFileResponse(
+        success=True,
+        downloaded_path=target_path_str,
+        bytes_downloaded=bytes_downloaded,
+        error=None,
+    )
+
+
 def full_system_health_check_impl() -> FullHealthCheckResponse:
     log_parts: list[str] = []
 
@@ -1120,13 +1228,32 @@ def execute_commands_impl(payload: ExecuteCommandsRequest) -> ExecuteCommandsRes
     if payload.session_metadata:
         session_doc["session_metadata"] = payload.session_metadata
 
-    log_session_to_mongo(session_doc)
+    # Determine whether MongoDB logging is effectively enabled
+    _init_mongo_if_needed()
+    logging_enabled = _mongo_collection is not None
+    if logging_enabled:
+        log_session_to_mongo(session_doc)
 
     return ExecuteCommandsResponse(
         success=overall_success,
         results=results,
         log="; ".join(log_lines),
+        logging_enabled=logging_enabled,
     )
+
+
+@app.get("/health")
+def health() -> dict[str, Any]:
+    """
+    Lightweight health endpoint for the system_ops backend.
+
+    Returns basic process status and whether MongoDB logging appears enabled.
+    """
+    _init_mongo_if_needed()
+    return {
+        "ok": True,
+        "mongo_logging_enabled": _mongo_collection is not None,
+    }
 
 
 @app.get("/tools/get_system_overview")
@@ -1191,6 +1318,15 @@ def run_defender_scan(request: DefenderScanRequest) -> DefenderScanResponse:
     HTTP tool: trigger a Windows Defender scan (quick, full, or path).
     """
     return run_defender_scan_impl(request)
+
+
+@app.post("/tools/download_file", response_model=DownloadFileResponse)
+def download_file(request: DownloadFileRequest) -> DownloadFileResponse:
+    """
+    HTTP tool: download a file from a URL to a local path using Python
+    (no PowerShell invocation).
+    """
+    return download_file_impl(request)
 
 
 @app.get("/tools/list_processes", response_model=ListProcessesResponse)

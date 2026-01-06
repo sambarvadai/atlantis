@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import uuid
 from typing import Any, Dict, List, Optional
 from urllib.error import HTTPError, URLError
@@ -14,7 +15,7 @@ from pydantic import BaseModel
 from main import app as mcp_app, run_agent
 
 
-SYSTEM_OPS_BASE_URL = "http://127.0.0.1:8000"
+SYSTEM_OPS_BASE_URL = os.getenv("SYSTEM_OPS_BASE_URL", "http://127.0.0.1:8000")
 
 
 frontend_app = FastAPI(
@@ -116,6 +117,7 @@ If the user asks about drivers (GPU, Wi-Fi, chipset, or device-specific drivers)
 1) Call appropriate `system_ops` tools to detect the local hardware and OS (e.g., get_system_overview, get_gpu_info, diagnose_network_issue).
 2) Call Tavily using that hardware/OS information to find official or reputable driver download pages.
 3) Include at least one direct driver download URL in the "notes" field so the user can click through.
+4) When you have a reliable direct download URL for an installer or driver, prefer calling the `download_file` tool from the `system_ops` server (over PowerShell download commands) to save the file into the user's Downloads folder with a sensible filename. Then, in your JSON plan, describe what was downloaded and where in the "notes" field, and propose any follow-up install commands separately.
 
 Finally, respond with a single JSON object ONLY (no extra text) in this exact shape:
 {{
@@ -135,16 +137,25 @@ Finally, respond with a single JSON object ONLY (no extra text) in this exact sh
 Rules:
 - For each command, set "reversible" to true ONLY if there is a clear, practical way to undo its effects; otherwise set it to false.
 - If no commands are needed or you cannot safely propose any commands, return "commands": [] and explain in "notes".
-- The \"text\" field for each command MUST be a command that can run directly in a Windows PowerShell terminal (e.g., PowerShell, winget, or choco). Do NOT return Python, C#, or HTTP API client code, and do NOT use function call syntax like default_api.run_defender_scan(...). Convert such calls into the underlying PowerShell or CLI commands instead.
+- The \"text\" field for each command MUST be a command that can run directly in a Windows PowerShell terminal (e.g., PowerShell, winget, or choco). Do NOT return Python, C#, or HTTP API client code, and do NOT use function call syntax like default_api.run_defender_scan(...). Convert such calls into the underlying PowerShell or CLI commands instead. For file downloads, prefer using the `download_file` tool as described above rather than emitting raw PowerShell download commands.
 - Do NOT wrap the JSON in backticks or add any commentary outside the JSON.
 """
 
-    async with mcp_app.run() as agent_app:
-        result_str = await run_agent(
-            agent_name="windows_troubleshooter",
-            prompt=prompt,
-            app_ctx=agent_app.context,
-        )
+    try:
+        async with mcp_app.run() as agent_app:
+            result_str = await run_agent(
+                agent_name="windows_troubleshooter",
+                prompt=prompt,
+                app_ctx=agent_app.context,
+            )
+    except Exception as exc:
+        # If the agent or MCP layer fails entirely, return a well-formed
+        # fallback plan so the frontend can surface a clear error.
+        return {
+            "summary": "Failed to generate troubleshooting plan.",
+            "commands": [],
+            "notes": f"Error while calling windows_troubleshooter agent: {exc}",
+        }
 
     raw = result_str.strip()
     if raw.startswith("```"):
@@ -177,7 +188,7 @@ Rules:
 
     # Fallback: return a minimal structure and include the raw text for debugging
     return {
-        "summary": "Failed to parse JSON plan from agent.",
+        "summary": "Failed to parse troubleshooting plan from agent.",
         "commands": [],
         "notes": result_str,
     }
@@ -218,6 +229,7 @@ async def index() -> HTMLResponse:
   <body>
     <div class="page">
       <h1>Windows Troubleshooter</h1>
+      <div id="health-warning" class="small" style="display:none; color:#b91c1c; margin-bottom:6px;"></div>
       <p class="small">
         Describe your Windows issue in plain language and I’ll propose a plan with steps and safe commands.
         Type <code>help</code> or <code>commands</code> to see examples of what you can ask.
@@ -318,14 +330,49 @@ async def index() -> HTMLResponse:
         }
       }
 
+      async function checkBackendHealth() {
+        try {
+          const resp = await fetch("/api/system_ops/health", { method: "GET" });
+          if (!resp.ok) {
+            throw new Error("HTTP " + resp.status);
+          }
+          const data = await resp.json();
+          if (!data.ok) {
+            const msg = "system_ops backend reported it is unavailable. Please ensure system_ops_server is running.";
+            const el = document.getElementById("health-warning");
+            el.textContent = msg;
+            el.style.display = "block";
+          }
+        } catch (err) {
+          const msg = "Unable to reach system_ops backend. Make sure it is running on 127.0.0.1:8000.";
+          const el = document.getElementById("health-warning");
+          el.textContent = msg;
+          el.style.display = "block";
+        }
+      }
+
       async function ensureSession() {
         if (sessionId) return sessionId;
-        const resp = await fetch("/api/session", { method: "POST" });
-        const data = await resp.json();
-        sessionId = data.session_id;
-        document.getElementById("session-id").textContent = sessionId;
-        document.getElementById("session-info").style.display = "block";
-        return sessionId;
+        try {
+          const resp = await fetch("/api/session", { method: "POST" });
+          if (!resp.ok) {
+            throw new Error("HTTP " + resp.status);
+          }
+          const data = await resp.json();
+          if (!data.session_id) {
+            throw new Error("Malformed session response");
+          }
+          sessionId = data.session_id;
+          document.getElementById("session-id").textContent = sessionId;
+          document.getElementById("session-info").style.display = "block";
+          return sessionId;
+        } catch (err) {
+          appendChatMessage(
+            "assistant",
+            "Unable to create a troubleshooting session. Please refresh the page and try again."
+          );
+          throw err;
+        }
       }
 
       document.getElementById("get-plan").addEventListener("click", async () => {
@@ -362,7 +409,12 @@ async def index() -> HTMLResponse:
           return;
         }
 
-        await ensureSession();
+        try {
+          await ensureSession();
+        } catch {
+          // Session creation already surfaced a user-friendly message.
+          return;
+        }
         appendChatMessage("user", problem);
         setStatus("Processing request (planning)...");
         document.getElementById("get-plan").disabled = true;
@@ -374,9 +426,15 @@ async def index() -> HTMLResponse:
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ problem, feedback: feedback || null, history: chatHistory })
           });
+          if (!resp.ok) {
+            throw new Error("HTTP " + resp.status);
+          }
           const data = await resp.json();
+          if (!data || typeof data.plan !== "object") {
+            throw new Error("Malformed plan response");
+          }
 
-          currentPlan = data.plan;
+          currentPlan = data.plan || {};
           const summary = currentPlan.summary || "";
           const notes = currentPlan.notes || "";
           appendChatMessage("assistant", summary || "(No summary provided)");
@@ -385,12 +443,12 @@ async def index() -> HTMLResponse:
           }
 
           document.getElementById("plan-summary").textContent = summary;
-          document.getElementById("plan-notes").textContent = notes;
+          document.getElementById("plan-notes").textContent = notes || "(No additional notes.)";
           document.getElementById("plan-section").style.display = "block";
 
           const container = document.getElementById("commands-container");
           container.innerHTML = "";
-          const cmds = currentPlan.commands || [];
+          const cmds = Array.isArray(currentPlan.commands) ? currentPlan.commands : [];
           if (!cmds.length) {
             container.textContent = "No commands proposed.";
           } else {
@@ -414,6 +472,12 @@ async def index() -> HTMLResponse:
               container.appendChild(div);
             });
           }
+        } catch (err) {
+          appendChatMessage(
+            "assistant",
+            "I couldn't generate a troubleshooting plan right now. Please try again, and check that the MCP agent is running."
+          );
+          document.getElementById("plan-section").style.display = "none";
         } finally {
           setStatus("");
           document.getElementById("get-plan").disabled = false;
@@ -468,6 +532,9 @@ async def index() -> HTMLResponse:
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload)
           });
+          if (!resp.ok) {
+            throw new Error("HTTP " + resp.status);
+          }
           const data = await resp.json();
           document.getElementById("exec-result").textContent = JSON.stringify(data, null, 2);
           document.getElementById("result-section").style.display = "block";
@@ -484,12 +551,26 @@ async def index() -> HTMLResponse:
               `Some commands failed (${ok}/${total} succeeded). Check the execution result below for details.`
             );
           }
+        } catch (err) {
+          const summary = {
+            success: false,
+            error: "Failed to execute commands via system_ops."
+          };
+          document.getElementById("exec-result").textContent = JSON.stringify(summary, null, 2);
+          document.getElementById("result-section").style.display = "block";
+          appendChatMessage(
+            "assistant",
+            "I couldn't execute the selected commands. Please make sure the system_ops backend is running and try again."
+          );
         } finally {
           setStatus("");
           document.getElementById("get-plan").disabled = false;
           document.getElementById("run-commands").disabled = false;
         }
       });
+
+      // Kick off a lightweight backend health check once the page is loaded.
+      checkBackendHealth();
     </script>
   </body>
 </html>
@@ -549,6 +630,36 @@ async def api_execute(session_id: str, req: ExecuteRequest) -> JSONResponse:
         session_metadata=session_metadata,
     )
     return JSONResponse(exec_result)
+
+
+@frontend_app.get("/api/system_ops/health")
+async def system_ops_health() -> JSONResponse:
+    """
+    Lightweight proxy to check whether the system_ops backend is reachable.
+    """
+    url = f"{SYSTEM_OPS_BASE_URL}/health"
+    req = Request(url, method="GET")
+    try:
+        with urlopen(req, timeout=5) as resp:
+            raw = resp.read().decode("utf-8")
+            if not raw:
+                return JSONResponse({"ok": False, "error": "Empty health response from system_ops."})
+            try:
+                data = json.loads(raw)
+            except Exception:
+                return JSONResponse({"ok": False, "error": "Malformed health response from system_ops."})
+            ok = bool(data.get("ok", True))
+            return JSONResponse({"ok": ok, "raw": data})
+    except HTTPError as e:
+        return JSONResponse(
+            {"ok": False, "error": f"HTTPError contacting system_ops health: {e}"},
+            status_code=502,
+        )
+    except URLError as e:
+        return JSONResponse(
+            {"ok": False, "error": f"URLError contacting system_ops health: {e}"},
+            status_code=502,
+        )
 
 
 async def main() -> None:

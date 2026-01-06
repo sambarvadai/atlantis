@@ -143,6 +143,18 @@ async def list_tools() -> List[mcp_types.Tool]:
 
     tools.append(
         mcp_types.Tool(
+            name="download_file",
+            description=(
+                "Download a file from an HTTP/HTTPS URL to a local path using Python, "
+                "without invoking PowerShell."
+            ),
+            inputSchema=_schema_from_model(ops.DownloadFileRequest),
+            outputSchema={"type": "object"},
+        )
+    )
+
+    tools.append(
+        mcp_types.Tool(
             name="list_processes",
             description="List running processes with basic CPU and memory information.",
             inputSchema=empty_input,
@@ -237,6 +249,10 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     if name == "run_defender_scan":
         payload = ops.DefenderScanRequest(**arguments)
         return _to_dict(ops.run_defender_scan_impl(payload))
+
+    if name == "download_file":
+        payload = ops.DownloadFileRequest(**arguments)
+        return _to_dict(ops.download_file_impl(payload))
 
     if name == "list_processes":
         return _to_dict(ops.list_processes_impl())

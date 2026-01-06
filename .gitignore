@@ -2,6 +2,7 @@
 mcp_agent.secrets.yaml
 *.secrets.yaml
 .mcp-agent/
+mcp_agent.config.yaml
 
 # Python
 __pycache__/
