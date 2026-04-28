@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import uuid
+from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -17,6 +18,17 @@ from main import app as mcp_app, run_agent
 
 SYSTEM_OPS_BASE_URL = os.getenv("SYSTEM_OPS_BASE_URL", "http://127.0.0.1:8000")
 
+_agent_ctx = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _agent_ctx
+    async with mcp_app.run() as agent_app:
+        _agent_ctx = agent_app.context
+        yield
+    _agent_ctx = None
+
 
 frontend_app = FastAPI(
     title="Windows Troubleshooter Frontend",
@@ -24,6 +36,7 @@ frontend_app = FastAPI(
         "Simple web frontend that ties together the MCP Tavily+Gemini agent "
         "with the system_ops FastAPI backend and MongoDB session logging."
     ),
+    lifespan=lifespan,
 )
 
 
@@ -98,59 +111,48 @@ async def get_troubleshooting_plan(
     )
 
     prompt = f"""
-You are a Windows troubleshooting assistant that can:
-- Use the `system_ops` server to inspect and act on this local Windows machine
-  (system overview, processes, services, Defender, performance, installs, etc.).
-- Use the `tavily` server to search the web for compatibility information,
-  error codes, known issues, and step-by-step fixes.
-
-User problem:
-{problem}
+User problem: {problem}
 {extra_feedback}
+For driver questions (GPU, Wi-Fi, chipset, etc.):
+1) Use `system_ops` tools to detect the exact hardware model and OS.
+2) Use Tavily with that info to find official driver download pages.
+3) Include at least one direct download URL in "notes".
+4) Prefer the `download_file` tool to save installers to the Downloads folder, then describe the download in "notes".
 
-First, prefer `system_ops` tools to gather local context or run built-in diagnostics
-when helpful (e.g., get_system_overview, diagnose_network_issue,
-diagnose_performance, full_system_health_check, get_gpu_info for GPU/driver questions).
-Then, use Tavily search to enrich your understanding and find best-practice fixes.
-
-If the user asks about drivers (GPU, Wi-Fi, chipset, or device-specific drivers), you must:
-1) Call appropriate `system_ops` tools to detect the local hardware and OS (e.g., get_system_overview, get_gpu_info, diagnose_network_issue).
-2) Call Tavily using that hardware/OS information to find official or reputable driver download pages.
-3) Include at least one direct driver download URL in the "notes" field so the user can click through.
-4) When you have a reliable direct download URL for an installer or driver, prefer calling the `download_file` tool from the `system_ops` server (over PowerShell download commands) to save the file into the user's Downloads folder with a sensible filename. Then, in your JSON plan, describe what was downloaded and where in the "notes" field, and propose any follow-up install commands separately.
-
-Finally, respond with a single JSON object ONLY (no extra text) in this exact shape:
+Respond with a single JSON object ONLY (no extra text, no backticks):
 {{
   "summary": "<one-line summary of the issue and fix>",
   "commands": [
     {{
-      "text": "PowerShell or winget/choco command to help fix the issue",
+      "text": "PowerShell, winget, or choco command",
       "reason": "why this command is needed",
       "origin": "agent",
       "reversible": false,
-      "rollback_notes": "If reversible=true, explain briefly how to undo this command. If false, explain why it is risky or hard to undo."
+      "rollback_notes": "how to undo if reversible=true, or why it is risky if false"
     }}
   ],
-  "notes": "<additional notes or manual steps for the user>"
+  "notes": "<additional notes or manual steps>"
 }}
 
 Rules:
-- For each command, set "reversible" to true ONLY if there is a clear, practical way to undo its effects; otherwise set it to false.
-- If no commands are needed or you cannot safely propose any commands, return "commands": [] and explain in "notes".
-- The \"text\" field for each command MUST be a command that can run directly in a Windows PowerShell terminal (e.g., PowerShell, winget, or choco). Do NOT return Python, C#, or HTTP API client code, and do NOT use function call syntax like default_api.run_defender_scan(...). Convert such calls into the underlying PowerShell or CLI commands instead. For file downloads, prefer using the `download_file` tool as described above rather than emitting raw PowerShell download commands.
-- Do NOT wrap the JSON in backticks or add any commentary outside the JSON.
+- Commands must run directly in a Windows PowerShell terminal. No Python, C#, or HTTP API syntax.
+- Set "reversible": true only if there is a clear, practical way to undo the effect.
+- If no commands are needed, return "commands": [] and explain in "notes".
 """
 
+    if _agent_ctx is None:
+        return {
+            "summary": "Failed to generate troubleshooting plan.",
+            "commands": [],
+            "notes": "Agent context not initialized. Please restart the server.",
+        }
     try:
-        async with mcp_app.run() as agent_app:
-            result_str = await run_agent(
-                agent_name="windows_troubleshooter",
-                prompt=prompt,
-                app_ctx=agent_app.context,
-            )
+        result_str = await run_agent(
+            agent_name="windows_troubleshooter",
+            prompt=prompt,
+            app_ctx=_agent_ctx,
+        )
     except Exception as exc:
-        # If the agent or MCP layer fails entirely, return a well-formed
-        # fallback plan so the frontend can surface a clear error.
         return {
             "summary": "Failed to generate troubleshooting plan.",
             "commands": [],
@@ -196,386 +198,312 @@ Rules:
 
 @frontend_app.get("/", response_class=HTMLResponse)
 async def index() -> HTMLResponse:
-    """
-    Serve a minimal single-page frontend for interactive troubleshooting.
-    """
-    html = """
-<!DOCTYPE html>
+    html = """<!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <title>Windows Troubleshooter</title>
-    <style>
-      body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; padding: 0; background: #f3f4f6; }
-      .page { max-width: 900px; margin: 0 auto; padding: 16px; min-height: 100vh; display: flex; flex-direction: column; }
-      textarea { width: 100%; min-height: 80px; }
-      button { margin-top: 8px; padding: 6px 12px; }
-      .section { margin-top: 20px; }
-      .commands { margin-top: 10px; }
-      .command-item { margin-bottom: 8px; border: 1px solid #ccc; padding: 6px; border-radius: 4px; }
-      pre { background: #f6f6f6; padding: 8px; border-radius: 4px; max-height: 240px; overflow: auto; }
-      .small { font-size: 0.85rem; color: #555; }
-      .chat-container { border: 1px solid #ddd; border-radius: 12px; padding: 10px 12px; max-height: 420px; overflow-y: auto; background: #ffffff; }
-      .chat-message { margin-bottom: 10px; display: flex; }
-      .chat-message.user { justify-content: flex-end; }
-      .chat-message.assistant { justify-content: flex-start; }
-      .chat-bubble { max-width: 75%; padding: 8px 10px; border-radius: 12px; }
-      .chat-bubble.user { background: #2563eb; color: #ffffff; border-bottom-right-radius: 2px; }
-      .chat-bubble.assistant { background: #e5e7eb; color: #111827; border-bottom-left-radius: 2px; }
-      .chat-role { font-weight: 600; display: block; margin-bottom: 2px; font-size: 0.8rem; opacity: 0.8; }
-      .footer { margin-top: auto; padding-top: 16px; }
-    </style>
-  </head>
-  <body>
-    <div class="page">
-      <h1>Windows Troubleshooter</h1>
-      <div id="health-warning" class="small" style="display:none; color:#b91c1c; margin-bottom:6px;"></div>
-      <p class="small">
-        Describe your Windows issue in plain language and I’ll propose a plan with steps and safe commands.
-        Type <code>help</code> or <code>commands</code> to see examples of what you can ask.
-      </p>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Atlantis \u2014 Windows Troubleshooter</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #f9fafb; --surface: #ffffff; --border: #e5e7eb;
+      --text: #111827; --muted: #6b7280;
+      --user-bg: #2563eb; --assist-bg: #f3f4f6;
+      --code-bg: #1e1e2e; --code-text: #cdd6f4;
+      --accent: #2563eb;
+    }
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: var(--bg); color: var(--text);
+      height: 100dvh; display: flex; flex-direction: column; overflow: hidden;
+    }
+    .header {
+      background: #1e1e2e; color: #cdd6f4;
+      padding: 12px 20px; display: flex; align-items: center; gap: 10px;
+      flex-shrink: 0; border-bottom: 1px solid #313244;
+    }
+    .header h1 { font-size: 1rem; font-weight: 600; letter-spacing: .02em; }
+    .header .pill {
+      font-size: .7rem; background: #313244; color: #89b4fa;
+      padding: 2px 8px; border-radius: 99px;
+    }
+    .health-warn {
+      background: #7f1d1d; color: #fca5a5;
+      padding: 6px 20px; font-size: .8rem; flex-shrink: 0; display: none;
+    }
+    .chat-area { flex: 1; overflow-y: auto; padding: 24px 0 8px; scroll-behavior: smooth; }
+    .messages {
+      max-width: 780px; margin: 0 auto; padding: 0 16px;
+      display: flex; flex-direction: column; gap: 16px;
+    }
+    .msg { display: flex; gap: 10px; }
+    .msg.user { justify-content: flex-end; }
+    .bubble { max-width: 82%; padding: 10px 14px; border-radius: 16px; line-height: 1.55; font-size: .925rem; }
+    .msg.user .bubble { background: var(--user-bg); color: #fff; border-bottom-right-radius: 4px; max-width: 70%; }
+    .msg.assistant .bubble { background: var(--assist-bg); color: var(--text); border-bottom-left-radius: 4px; max-width: 90%; }
+    .msg-icon {
+      width: 28px; height: 28px; border-radius: 50%;
+      background: #1e1e2e; color: #89b4fa;
+      display: flex; align-items: center; justify-content: center;
+      font-size: .72rem; font-weight: 700; flex-shrink: 0; margin-top: 2px;
+    }
+    .bubble a { color: #3b82f6; }
+    .bubble p + p { margin-top: 6px; }
+    /* command block */
+    .cmd-block { margin-top: 10px; border-radius: 10px; overflow: hidden; border: 1px solid #313244; background: var(--code-bg); }
+    .cmd-header { display: flex; align-items: center; justify-content: space-between; padding: 7px 12px; background: #181825; gap: 8px; }
+    .cmd-reason { font-size: .78rem; color: #a6adc8; flex: 1; }
+    .cmd-badges { display: flex; gap: 4px; align-items: center; flex-shrink: 0; }
+    .rev-badge { font-size: .68rem; padding: 2px 7px; border-radius: 99px; }
+    .rev-badge.yes { background: #1e3a2f; color: #4ade80; }
+    .rev-badge.no  { background: #3b1f1f; color: #f87171; }
+    .cmd-row { display: flex; align-items: center; padding: 10px 12px; gap: 12px; }
+    .cmd-code { flex: 1; font-family: "Cascadia Code","Fira Code",Consolas,monospace; font-size: .83rem; color: var(--code-text); white-space: pre-wrap; word-break: break-all; }
+    .run-btn {
+      flex-shrink: 0; background: #16a34a; color: #fff; border: none; border-radius: 6px;
+      padding: 6px 13px; font-size: .8rem; cursor: pointer;
+      display: flex; align-items: center; gap: 5px;
+      transition: background .15s, opacity .15s; white-space: nowrap;
+    }
+    .run-btn:hover:not(:disabled) { background: #15803d; }
+    .run-btn:disabled { opacity: .6; cursor: not-allowed; }
+    .run-btn.running { background: #1d4ed8; }
+    .run-btn.ok  { background: #15803d; }
+    .run-btn.err { background: #b91c1c; }
+    .cmd-output {
+      padding: 8px 12px; background: #11111b;
+      font-family: Consolas, monospace; font-size: .78rem;
+      white-space: pre-wrap; word-break: break-all;
+      max-height: 220px; overflow-y: auto;
+      border-top: 1px solid #313244; display: none;
+    }
+    .cmd-output.show { display: block; }
+    .cmd-output.ok  { color: #4ade80; }
+    .cmd-output.err { color: #f87171; }
+    /* typing */
+    .typing { display: flex; gap: 4px; padding: 10px 14px; background: var(--assist-bg); border-radius: 16px; border-bottom-left-radius: 4px; width: fit-content; }
+    .dot { width: 6px; height: 6px; border-radius: 50%; background: #9ca3af; animation: pop 1.2s infinite; }
+    .dot:nth-child(2) { animation-delay: .2s; }
+    .dot:nth-child(3) { animation-delay: .4s; }
+    @keyframes pop { 0%,80%,100%{transform:translateY(0);opacity:.4;} 40%{transform:translateY(-6px);opacity:1;} }
+    /* input */
+    .input-bar { flex-shrink: 0; padding: 10px 16px 12px; background: var(--surface); border-top: 1px solid var(--border); }
+    .input-inner { max-width: 780px; margin: 0 auto; display: flex; gap: 8px; align-items: flex-end; }
+    .input-inner textarea {
+      flex: 1; border: 1px solid var(--border); border-radius: 12px;
+      padding: 10px 14px; font-size: .925rem; font-family: inherit;
+      resize: none; max-height: 160px; min-height: 44px; line-height: 1.45;
+      outline: none; transition: border-color .15s;
+    }
+    .input-inner textarea:focus { border-color: var(--accent); }
+    .send-btn {
+      flex-shrink: 0; width: 40px; height: 40px; border-radius: 10px;
+      background: var(--accent); color: #fff; border: none; cursor: pointer;
+      display: flex; align-items: center; justify-content: center; transition: background .15s;
+    }
+    .send-btn:hover:not(:disabled) { background: #1d4ed8; }
+    .send-btn:disabled { background: #9ca3af; cursor: not-allowed; }
+    .send-btn svg { width: 16px; height: 16px; fill: currentColor; }
+    .input-hint { font-size: .72rem; color: var(--muted); margin-top: 5px; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>&#128736; Atlantis</h1>
+    <span class="pill">Windows Troubleshooter</span>
+  </div>
+  <div class="health-warn" id="health-warn"></div>
 
-      <div class="section">
-        <div class="chat-container" id="chat-log"></div>
-        <div id="status" class="small" style="display:none; margin-top:6px;"></div>
-      </div>
-
-      <div class="section">
-        <label for="problem">Message:</label><br />
-        <textarea id="problem" placeholder="Describe your Windows issue or ask what to do next..."></textarea>
-        <br />
-        <label for="feedback" class="small">Optional refinement for this turn:</label><br />
-        <textarea id="feedback" placeholder="e.g. Prefer winget over choco; don't run full Defender scans"></textarea>
-        <br />
-        <button id="get-plan">Send</button>
-      </div>
-
-      <div class="section" id="session-info" style="display:none;">
-        <strong>Session ID:</strong> <span id="session-id"></span>
-      </div>
-
-      <div class="section" id="plan-section" style="display:none;">
-        <h2>Plan</h2>
-        <p><strong>Summary:</strong> <span id="plan-summary"></span></p>
-        <p><strong>Notes:</strong></p>
-        <pre id="plan-notes"></pre>
-
-        <div class="commands">
-          <h3>Proposed commands</h3>
-          <div id="commands-container"></div>
-          <button id="run-commands">Run selected commands</button>
+  <div class="chat-area" id="chat-area">
+    <div class="messages" id="messages">
+      <div class="msg assistant">
+        <div class="msg-icon">A</div>
+        <div class="bubble">
+          Hey! Describe your Windows issue and I&#8217;ll diagnose it and suggest fixes.
+          Hit &#9654; <strong>Run</strong> on any command to execute it directly.<br /><br />
+          <span style="color:#6b7280;font-size:.85rem">Try: &#8220;my Wi-Fi keeps dropping&#8221; &middot; &#8220;PC is really slow&#8221; &middot; &#8220;install VS Code&#8221;</span>
         </div>
       </div>
-
-      <div class="section" id="result-section" style="display:none;">
-        <h2>Execution result</h2>
-        <pre id="exec-result"></pre>
-      </div>
-
-      <div class="footer small">
-        <span>Tip: Treat this like a chat. Ask a question, review the plan, then choose which commands to run.</span>
-      </div>
     </div>
+  </div>
 
-    <script>
-      let sessionId = null;
-      let currentPlan = null;
-      let chatHistory = [];
+  <div class="input-bar">
+    <div class="input-inner">
+      <textarea id="input" placeholder="Describe your Windows issue&#8230;" rows="1"></textarea>
+      <button class="send-btn" id="send-btn" title="Send (Enter)">
+        <svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+      </button>
+    </div>
+    <div class="input-hint">Enter to send &middot; Shift+Enter for new line</div>
+  </div>
 
-      function linkify(text) {
-        const urlRegex = /(https?:\/\/[^\s]+)/g;
-        return text.replace(urlRegex, function(url) {
-          const safeUrl = url.replace(/"/g, "%22");
-          return '<a href="' + safeUrl + '" target="_blank" rel="noopener noreferrer">' + url + "</a>";
-        });
+  <script>
+    let sessionId = null;
+    let chatHistory = [];
+    let busy = false;
+
+    const messagesEl = document.getElementById("messages");
+    const chatArea   = document.getElementById("chat-area");
+    const inputEl    = document.getElementById("input");
+    const sendBtn    = document.getElementById("send-btn");
+
+    inputEl.addEventListener("input", () => {
+      inputEl.style.height = "auto";
+      inputEl.style.height = Math.min(inputEl.scrollHeight, 160) + "px";
+    });
+    inputEl.addEventListener("keydown", e => {
+      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); if (!busy) send(); }
+    });
+    sendBtn.addEventListener("click", () => { if (!busy) send(); });
+
+    function scroll() { chatArea.scrollTop = chatArea.scrollHeight; }
+
+    function linkify(t) {
+      return t.replace(/(https?:\\/\\/[^\\s<>"]+)/g, u =>
+        '<a href="' + u.replace(/"/g, "%22") + '" target="_blank" rel="noopener">' + u + "</a>");
+    }
+
+    function addUserBubble(text) {
+      const row = document.createElement("div"); row.className = "msg user";
+      const b = document.createElement("div"); b.className = "bubble"; b.textContent = text;
+      row.appendChild(b); messagesEl.appendChild(row); scroll();
+      chatHistory.push({ role: "user", text });
+    }
+
+    function addTyping() {
+      const row = document.createElement("div"); row.className = "msg assistant"; row.id = "typing";
+      const icon = document.createElement("div"); icon.className = "msg-icon"; icon.textContent = "A";
+      const t = document.createElement("div"); t.className = "typing";
+      t.innerHTML = '<div class="dot"></div><div class="dot"></div><div class="dot"></div>';
+      row.appendChild(icon); row.appendChild(t); messagesEl.appendChild(row); scroll();
+    }
+    function removeTyping() { const el = document.getElementById("typing"); if (el) el.remove(); }
+
+    function addAssistantBubble(plan) {
+      const row = document.createElement("div"); row.className = "msg assistant";
+      const icon = document.createElement("div"); icon.className = "msg-icon"; icon.textContent = "A";
+      const bubble = document.createElement("div"); bubble.className = "bubble";
+
+      const summary = (plan.summary || "").trim();
+      const notes   = (plan.notes   || "").trim();
+
+      if (summary) {
+        const p = document.createElement("p"); p.innerHTML = linkify(summary); bubble.appendChild(p);
+      }
+      if (notes && notes !== summary) {
+        const p = document.createElement("p");
+        p.style.cssText = "margin-top:6px;font-size:.875rem;color:#374151;";
+        p.innerHTML = linkify(notes); bubble.appendChild(p);
       }
 
-      function appendChatMessage(role, text) {
-        const log = document.getElementById("chat-log");
-        const div = document.createElement("div");
-        div.className = "chat-message " + (role === "user" ? "user" : "assistant");
+      const cmds = Array.isArray(plan.commands) ? plan.commands : [];
+      cmds.forEach(cmd => {
+        const block = document.createElement("div"); block.className = "cmd-block";
 
-        const bubble = document.createElement("div");
-        bubble.className = "chat-bubble " + (role === "user" ? "user" : "assistant");
+        const hdr = document.createElement("div"); hdr.className = "cmd-header";
+        const reason = document.createElement("span"); reason.className = "cmd-reason";
+        reason.textContent = cmd.reason || "";
+        const badges = document.createElement("div"); badges.className = "cmd-badges";
+        const badge = document.createElement("span");
+        badge.className = "rev-badge " + (cmd.reversible === true ? "yes" : "no");
+        badge.textContent = cmd.reversible === true ? "reversible" : "irreversible";
+        badges.appendChild(badge); hdr.appendChild(reason); hdr.appendChild(badges);
 
-        const who = document.createElement("span");
-        who.className = "chat-role";
-        who.textContent = role === "user" ? "You" : "Assistant";
+        const cmdRow = document.createElement("div"); cmdRow.className = "cmd-row";
+        const code = document.createElement("span"); code.className = "cmd-code"; code.textContent = cmd.text || "";
+        const output = document.createElement("div"); output.className = "cmd-output";
+        const btn = document.createElement("button"); btn.className = "run-btn";
+        btn.innerHTML = "&#9654; Run";
+        btn.addEventListener("click", () => execCommand(btn, cmd, output));
+        cmdRow.appendChild(code); cmdRow.appendChild(btn);
 
-        const body = document.createElement("div");
-        if (role === "assistant") {
-          body.innerHTML = linkify(text);
-        } else {
-          body.textContent = text;
-        }
-
-        bubble.appendChild(who);
-        bubble.appendChild(body);
-        div.appendChild(bubble);
-        log.appendChild(div);
-        log.scrollTop = log.scrollHeight;
-
-        // Track history so the agent can see prior context
-        chatHistory.push({ role, text });
-      }
-
-      function setStatus(text) {
-        const el = document.getElementById("status");
-        if (text) {
-          el.textContent = text;
-          el.style.display = "block";
-        } else {
-          el.textContent = "";
-          el.style.display = "none";
-        }
-      }
-
-      async function checkBackendHealth() {
-        try {
-          const resp = await fetch("/api/system_ops/health", { method: "GET" });
-          if (!resp.ok) {
-            throw new Error("HTTP " + resp.status);
-          }
-          const data = await resp.json();
-          if (!data.ok) {
-            const msg = "system_ops backend reported it is unavailable. Please ensure system_ops_server is running.";
-            const el = document.getElementById("health-warning");
-            el.textContent = msg;
-            el.style.display = "block";
-          }
-        } catch (err) {
-          const msg = "Unable to reach system_ops backend. Make sure it is running on 127.0.0.1:8000.";
-          const el = document.getElementById("health-warning");
-          el.textContent = msg;
-          el.style.display = "block";
-        }
-      }
-
-      async function ensureSession() {
-        if (sessionId) return sessionId;
-        try {
-          const resp = await fetch("/api/session", { method: "POST" });
-          if (!resp.ok) {
-            throw new Error("HTTP " + resp.status);
-          }
-          const data = await resp.json();
-          if (!data.session_id) {
-            throw new Error("Malformed session response");
-          }
-          sessionId = data.session_id;
-          document.getElementById("session-id").textContent = sessionId;
-          document.getElementById("session-info").style.display = "block";
-          return sessionId;
-        } catch (err) {
-          appendChatMessage(
-            "assistant",
-            "Unable to create a troubleshooting session. Please refresh the page and try again."
-          );
-          throw err;
-        }
-      }
-
-      document.getElementById("get-plan").addEventListener("click", async () => {
-        const problem = document.getElementById("problem").value.trim();
-        const feedback = document.getElementById("feedback").value.trim();
-        if (!problem) {
-          alert("Please describe your Windows issue first.");
-          return;
-        }
-
-        const norm = problem.toLowerCase().trim();
-        if (
-          norm === "help" ||
-          norm === "/help" ||
-          norm === "commands" ||
-          norm.indexOf("list commands") !== -1 ||
-          norm.indexOf("what can you do") !== -1 ||
-          norm.indexOf("what can i ask") !== -1
-        ) {
-          appendChatMessage("user", problem);
-          const helpText = [
-            "Here are some example things you can ask:",
-            "- Show my system specs or a system health overview.",
-            "- Diagnose my network or slow Wi-Fi.",
-            "- Check why my PC is slow (disk space, top CPU/RAM processes).",
-            "- Run a quick Defender scan or scan a specific folder.",
-            "- Install or uninstall apps (e.g., Chrome, VS Code, VLC).",
-            "- List running processes or restart a Windows service.",
-            "- Troubleshoot a specific error code (e.g., a game crash or 0xC0000005).",
-            "",
-            "I will propose a plan and one or more commands. You can review and choose which commands to run."
-          ].join("\\n");
-          appendChatMessage("assistant", helpText);
-          return;
-        }
-
-        try {
-          await ensureSession();
-        } catch {
-          // Session creation already surfaced a user-friendly message.
-          return;
-        }
-        appendChatMessage("user", problem);
-        setStatus("Processing request (planning)...");
-        document.getElementById("get-plan").disabled = true;
-        document.getElementById("run-commands").disabled = true;
-
-        try {
-          const resp = await fetch(`/api/session/${encodeURIComponent(sessionId)}/plan`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ problem, feedback: feedback || null, history: chatHistory })
-          });
-          if (!resp.ok) {
-            throw new Error("HTTP " + resp.status);
-          }
-          const data = await resp.json();
-          if (!data || typeof data.plan !== "object") {
-            throw new Error("Malformed plan response");
-          }
-
-          currentPlan = data.plan || {};
-          const summary = currentPlan.summary || "";
-          const notes = currentPlan.notes || "";
-          appendChatMessage("assistant", summary || "(No summary provided)");
-          if (notes) {
-            appendChatMessage("assistant", "Notes: " + notes);
-          }
-
-          document.getElementById("plan-summary").textContent = summary;
-          document.getElementById("plan-notes").textContent = notes || "(No additional notes.)";
-          document.getElementById("plan-section").style.display = "block";
-
-          const container = document.getElementById("commands-container");
-          container.innerHTML = "";
-          const cmds = Array.isArray(currentPlan.commands) ? currentPlan.commands : [];
-          if (!cmds.length) {
-            container.textContent = "No commands proposed.";
-          } else {
-            cmds.forEach((cmd, idx) => {
-              const div = document.createElement("div");
-              div.className = "command-item";
-              const checkbox = document.createElement("input");
-              checkbox.type = "checkbox";
-              checkbox.id = "cmd-" + idx;
-              checkbox.checked = true;
-              const label = document.createElement("label");
-              label.htmlFor = checkbox.id;
-              label.innerHTML = `<code>${cmd.text || ""}</code><br />
-                <span class="small">Reason: ${cmd.reason || ""}</span><br />
-                <span class="small">Reversible: ${
-                  cmd.reversible === true ? "yes" : cmd.reversible === false ? "no" : "unknown"
-                }</span><br />
-                <span class="small">Rollback notes: ${cmd.rollback_notes || ""}</span>`;
-              div.appendChild(checkbox);
-              div.appendChild(label);
-              container.appendChild(div);
-            });
-          }
-        } catch (err) {
-          appendChatMessage(
-            "assistant",
-            "I couldn't generate a troubleshooting plan right now. Please try again, and check that the MCP agent is running."
-          );
-          document.getElementById("plan-section").style.display = "none";
-        } finally {
-          setStatus("");
-          document.getElementById("get-plan").disabled = false;
-          document.getElementById("run-commands").disabled = false;
-        }
+        block.appendChild(hdr); block.appendChild(cmdRow); block.appendChild(output);
+        bubble.appendChild(block);
       });
 
-      document.getElementById("run-commands").addEventListener("click", async () => {
-        if (!currentPlan) {
-          alert("No plan available yet.");
-          return;
-        }
-        if (!sessionId) {
-          alert("Session not initialized.");
-          return;
-        }
+      row.appendChild(icon); row.appendChild(bubble); messagesEl.appendChild(row); scroll();
+      chatHistory.push({ role: "assistant", text: summary });
+    }
 
-        const problem = document.getElementById("problem").value.trim();
-        const cmds = currentPlan.commands || [];
-        const selected = [];
-        cmds.forEach((cmd, idx) => {
-          const cb = document.getElementById("cmd-" + idx);
-          if (cb && cb.checked) {
-            selected.push({
-              text: cmd.text || "",
-              reason: cmd.reason || null,
-              origin: cmd.origin || "agent"
-            });
-          }
+    async function execCommand(btn, cmd, outputEl) {
+      if (!sessionId) return;
+      btn.disabled = true; btn.className = "run-btn running"; btn.textContent = "Running\u2026";
+      outputEl.className = "cmd-output show"; outputEl.textContent = "Running\u2026";
+      try {
+        const resp = await fetch("/api/session/" + encodeURIComponent(sessionId) + "/execute", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            problem: (chatHistory.find(m => m.role === "user") || {}).text || "",
+            commands: [{ text: cmd.text, reason: cmd.reason || null, origin: cmd.origin || "agent" }]
+          })
         });
+        const data = await resp.json();
+        const r = data.results && data.results[0];
+        const ok = r ? (r.exit_code === 0 || r.exit_code === null) : !!data.success;
+        const out = r ? ((r.stdout || "") + (r.stderr ? "\\n" + r.stderr : "")).trim()
+                      : JSON.stringify(data, null, 2);
+        btn.className = "run-btn " + (ok ? "ok" : "err");
+        btn.innerHTML = ok ? "&#10003; Done" : "&#10007; Failed";
+        outputEl.className = "cmd-output show " + (ok ? "ok" : "err");
+        outputEl.textContent = out || (ok ? "Command completed successfully." : "Command failed with no output.");
+      } catch (err) {
+        btn.className = "run-btn err"; btn.innerHTML = "&#10007; Error";
+        outputEl.className = "cmd-output show err";
+        outputEl.textContent = "Request failed: " + err.message;
+      }
+      scroll();
+    }
 
-        if (!selected.length) {
-          alert("No commands selected.");
-          return;
-        }
+    async function ensureSession() {
+      if (sessionId) return;
+      const r = await fetch("/api/session", { method: "POST" });
+      const d = await r.json();
+      sessionId = d.session_id;
+    }
 
-        const payload = {
-          problem: problem,
-          summary: currentPlan.summary || "",
-          notes: currentPlan.notes || "",
-          commands: selected
-        };
+    async function send() {
+      const text = inputEl.value.trim();
+      if (!text) return;
+      inputEl.value = ""; inputEl.style.height = "auto";
+      busy = true; sendBtn.disabled = true;
+      addUserBubble(text); addTyping();
+      try {
+        await ensureSession();
+        const resp = await fetch("/api/session/" + encodeURIComponent(sessionId) + "/plan", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ problem: text, history: chatHistory })
+        });
+        const data = await resp.json();
+        removeTyping();
+        addAssistantBubble(data.plan || { summary: "No plan returned.", commands: [] });
+      } catch {
+        removeTyping();
+        addAssistantBubble({ summary: "Something went wrong \u2014 please try again.", commands: [] });
+      } finally {
+        busy = false; sendBtn.disabled = false; inputEl.focus();
+      }
+    }
 
-        appendChatMessage("assistant", "Executing selected commands via system_ops...");
-        setStatus("Processing request (executing commands)...");
-        document.getElementById("get-plan").disabled = true;
-        document.getElementById("run-commands").disabled = true;
-
-        try {
-          const resp = await fetch(`/api/session/${encodeURIComponent(sessionId)}/execute`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload)
-          });
-          if (!resp.ok) {
-            throw new Error("HTTP " + resp.status);
-          }
-          const data = await resp.json();
-          document.getElementById("exec-result").textContent = JSON.stringify(data, null, 2);
-          document.getElementById("result-section").style.display = "block";
-          const total = (data.results && data.results.length) || selected.length;
-          const ok = (data.results || []).filter(r => r.exit_code === 0 || r.exit_code === null).length;
-          if (data.success) {
-            appendChatMessage(
-              "assistant",
-              `Finished executing commands (${ok}/${total} succeeded). See details below.`
-            );
-          } else {
-            appendChatMessage(
-              "assistant",
-              `Some commands failed (${ok}/${total} succeeded). Check the execution result below for details.`
-            );
-          }
-        } catch (err) {
-          const summary = {
-            success: false,
-            error: "Failed to execute commands via system_ops."
-          };
-          document.getElementById("exec-result").textContent = JSON.stringify(summary, null, 2);
-          document.getElementById("result-section").style.display = "block";
-          appendChatMessage(
-            "assistant",
-            "I couldn't execute the selected commands. Please make sure the system_ops backend is running and try again."
-          );
-        } finally {
-          setStatus("");
-          document.getElementById("get-plan").disabled = false;
-          document.getElementById("run-commands").disabled = false;
-        }
-      });
-
-      // Kick off a lightweight backend health check once the page is loaded.
-      checkBackendHealth();
-    </script>
-  </body>
-</html>
-    """
+    (async () => {
+      try {
+        const r = await fetch("/api/system_ops/health");
+        const d = await r.json();
+        if (!d.ok) throw new Error();
+      } catch {
+        const el = document.getElementById("health-warn");
+        el.textContent = "\u26a0 system_ops backend unreachable \u2014 make sure system_ops_server is running on port 8000.";
+        el.style.display = "block";
+      }
+    })();
+  </script>
+</body>
+</html>"""
     return HTMLResponse(content=html)
+
+
 
 
 @frontend_app.post("/api/session")

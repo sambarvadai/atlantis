@@ -65,6 +65,24 @@ async def finder_agent(request: str, app_ctx: Optional[AppContext] = None) -> st
     async with agent:
         llm = await agent.attach_llm(GoogleAugmentedLLM)
         result = await llm.generate_str(message=request)
+
+        # Best-effort logging of LLM token usage / cost for observability.
+        try:
+            usage = await agent.get_token_usage()
+            cost = await agent.get_token_cost()
+            logger.info(
+                "LLM token usage for finder_agent",
+                data={
+                    "usage": usage,
+                    "estimated_cost_usd": cost,
+                },
+            )
+        except Exception as exc:  # pragma: no cover - observability only
+            logger.warning(
+                "Failed to record LLM token usage for finder_agent",
+                data={"error": str(exc)},
+            )
+
         return result
 
 
@@ -87,20 +105,14 @@ async def run_agent(
 
     logger = app_ctx.app.logger
 
-    agent_definitions = (
-        app.config.agents.definitions
-        if app is not None
-        and app.config is not None
-        and app.config.agents is not None
-        and app.config.agents.definitions is not None
-        else []
-    )
+    try:
+        agent_definitions = app.config.agents.definitions or []
+    except AttributeError:
+        agent_definitions = []
 
-    agent_spec: AgentSpec | None = None
-    for agent_def in agent_definitions:
-        if agent_def.name == agent_name:
-            agent_spec = agent_def
-            break
+    agent_spec: AgentSpec | None = next(
+        (d for d in agent_definitions if d.name == agent_name), None
+    )
 
     if agent_spec is None:
         logger.error("Agent not found", data={"name": agent_name})
@@ -115,7 +127,27 @@ async def run_agent(
 
     async with agent:
         llm = await agent.attach_llm(GoogleAugmentedLLM)
-        return await llm.generate_str(message=prompt)
+        result = await llm.generate_str(message=prompt)
+
+        # Best-effort logging of LLM token usage / cost for observability.
+        try:
+            usage = await agent.get_token_usage()
+            cost = await agent.get_token_cost()
+            logger.info(
+                "LLM token usage for run_agent",
+                data={
+                    "agent_name": agent_name,
+                    "usage": usage,
+                    "estimated_cost_usd": cost,
+                },
+            )
+        except Exception as exc:  # pragma: no cover - observability only
+            logger.warning(
+                "Failed to record LLM token usage for run_agent",
+                data={"error": str(exc), "agent_name": agent_name},
+            )
+
+        return result
 
 
 async def main():

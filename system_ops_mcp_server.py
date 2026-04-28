@@ -204,20 +204,42 @@ async def list_tools() -> List[mcp_types.Tool]:
     return tools
 
 
+_STDOUT_MAX = 3000
+_STDERR_MAX = 500
+
+
+def _truncate_outputs(d: Any) -> Any:
+    """Recursively truncate stdout/stderr strings to keep LLM token usage low."""
+    if isinstance(d, dict):
+        out = {}
+        for k, v in d.items():
+            if k == "stdout" and isinstance(v, str) and len(v) > _STDOUT_MAX:
+                out[k] = v[:_STDOUT_MAX] + f"\n…[truncated, {len(v) - _STDOUT_MAX} chars omitted]"
+            elif k == "stderr" and isinstance(v, str) and len(v) > _STDERR_MAX:
+                out[k] = v[:_STDERR_MAX] + f"\n…[truncated, {len(v) - _STDERR_MAX} chars omitted]"
+            else:
+                out[k] = _truncate_outputs(v)
+        return out
+    if isinstance(d, list):
+        return [_truncate_outputs(item) for item in d]
+    return d
+
+
 @mcp_server.call_tool()
 async def call_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     """
     Dispatch MCP tool calls to the underlying system_ops implementations.
     """
 
-    # Helper to normalize pydantic models to plain dicts
+    # Helper to normalize pydantic models to plain dicts and truncate verbose fields
     def _to_dict(value: Any) -> Dict[str, Any]:
         if hasattr(value, "model_dump"):
-            return value.model_dump()  # type: ignore[no-any-return]
-        if isinstance(value, dict):
-            return value
-        # Fallback: wrap as-is
-        return {"result": value}
+            raw = value.model_dump()  # type: ignore[no-any-return]
+        elif isinstance(value, dict):
+            raw = value
+        else:
+            raw = {"result": value}
+        return _truncate_outputs(raw)  # type: ignore[return-value]
 
     if name == "get_system_overview":
         return _to_dict(ops.get_system_overview_impl())

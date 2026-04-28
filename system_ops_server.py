@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import subprocess
@@ -127,12 +128,31 @@ def run_powershell(command: str, timeout: int = 60) -> subprocess.CompletedProce
 
 
 def is_command_available(command: str) -> bool:
-    """Check if a given command is available on PATH using where.exe."""
+    """Check if a given command is available using where.exe, with a PowerShell fallback.
+
+    winget is installed as a Windows App Package and may not appear via `where`
+    in non-interactive subprocess contexts, so we also try running the command
+    with --version as a fallback.
+    """
     try:
         result = subprocess.run(
             ["where", command],
             capture_output=True,
             text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            return True
+    except Exception:
+        pass
+
+    # Fallback: try invoking the command directly (handles winget App Package installs)
+    try:
+        result = subprocess.run(
+            [command, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         return result.returncode == 0
     except Exception:
@@ -141,61 +161,40 @@ def is_command_available(command: str) -> bool:
 
 def get_system_overview_impl() -> dict:
     """Gather basic system information using PowerShell and return structured JSON."""
-    # OS info
     os_cmd = (
         "Get-CimInstance Win32_OperatingSystem | "
         "Select-Object Caption, Version, OSArchitecture, LastBootUpTime, "
         "TotalVisibleMemorySize, FreePhysicalMemory | ConvertTo-Json -Depth 3"
     )
-    os_proc = run_powershell(os_cmd)
-
-    # CPU info
     cpu_cmd = (
         "Get-CimInstance Win32_Processor | "
         "Select-Object Name, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed | "
         "ConvertTo-Json -Depth 3"
     )
-    cpu_proc = run_powershell(cpu_cmd)
-
-    # Disk info
     disk_cmd = (
         "Get-PSDrive -PSProvider FileSystem | "
         "Select-Object Name, Used, Free | ConvertTo-Json -Depth 3"
     )
-    disk_proc = run_powershell(disk_cmd)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+        f_os = ex.submit(run_powershell, os_cmd)
+        f_cpu = ex.submit(run_powershell, cpu_cmd)
+        f_disk = ex.submit(run_powershell, disk_cmd)
+        os_proc = f_os.result()
+        cpu_proc = f_cpu.result()
+        disk_proc = f_disk.result()
 
     errors: list[str] = []
-
-    def safe_json_loads(raw: str, label: str) -> Optional[object]:
-        if not raw:
-            errors.append(f"{label} output empty")
-            return None
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            errors.append(f"Failed to parse {label} JSON")
-            return None
-
-    os_info = safe_json_loads(os_proc.stdout, "os")
-    cpu_info = safe_json_loads(cpu_proc.stdout, "cpu")
-    disk_info = safe_json_loads(disk_proc.stdout, "disk")
-
-    success = len(errors) == 0
+    os_info = safe_json_loads(os_proc.stdout, "os", errors)
+    cpu_info = safe_json_loads(cpu_proc.stdout, "cpu", errors)
+    disk_info = safe_json_loads(disk_proc.stdout, "disk", errors)
 
     return {
-        "success": success,
+        "success": len(errors) == 0,
         "os": os_info,
         "cpu": cpu_info,
         "disks": disk_info,
         "errors": errors,
-        "raw": {
-            "os_stdout": os_proc.stdout,
-            "os_stderr": os_proc.stderr,
-            "cpu_stdout": cpu_proc.stdout,
-            "cpu_stderr": cpu_proc.stderr,
-            "disk_stdout": disk_proc.stdout,
-            "disk_stderr": disk_proc.stderr,
-        },
     }
 
 
@@ -282,27 +281,27 @@ def diagnose_network_issue_impl() -> NetworkDiagnoseResponse:
     errors: list[str] = []
     log_parts: list[str] = []
 
-    # Adapter info
     adapters_cmd = (
         "Get-NetAdapter | "
         "Select-Object Name, Status, LinkSpeed, MacAddress | "
         "ConvertTo-Json -Depth 4"
     )
-    adapters_proc = run_powershell(adapters_cmd)
-
-    # Ping a public IP
     ip_test_cmd = (
         "Test-NetConnection -ComputerName 8.8.8.8 -InformationLevel Detailed "
         "| ConvertTo-Json -Depth 4"
     )
-    ip_test_proc = run_powershell(ip_test_cmd)
-
-    # Ping a domain for DNS test
     dns_test_cmd = (
         "Test-NetConnection -ComputerName www.microsoft.com "
         "-InformationLevel Detailed | ConvertTo-Json -Depth 4"
     )
-    dns_test_proc = run_powershell(dns_test_cmd)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+        f_adapters = ex.submit(run_powershell, adapters_cmd)
+        f_ip = ex.submit(run_powershell, ip_test_cmd)
+        f_dns = ex.submit(run_powershell, dns_test_cmd)
+        adapters_proc = f_adapters.result()
+        ip_test_proc = f_ip.result()
+        dns_test_proc = f_dns.result()
 
     adapters = safe_json_loads(adapters_proc.stdout, "adapters", errors)
     ip_test = safe_json_loads(ip_test_proc.stdout, "ip_test", errors)
@@ -312,14 +311,6 @@ def diagnose_network_issue_impl() -> NetworkDiagnoseResponse:
         "adapters": adapters,
         "ip_test": ip_test,
         "dns_test": dns_test,
-        "raw": {
-            "adapters_stdout": adapters_proc.stdout,
-            "adapters_stderr": adapters_proc.stderr,
-            "ip_test_stdout": ip_test_proc.stdout,
-            "ip_test_stderr": ip_test_proc.stderr,
-            "dns_test_stdout": dns_test_proc.stdout,
-            "dns_test_stderr": dns_test_proc.stderr,
-        },
         "errors": errors,
     }
 
@@ -544,7 +535,7 @@ def ensure_choco(allow_install: bool) -> tuple[bool, bool, str]:
         "iex ((New-Object System.Net.WebClient).DownloadString("
         "'https://community.chocolatey.org/install.ps1'))"
     )
-    proc = run_powershell(install_script)
+    proc = run_powershell(install_script, timeout=300)
     if proc.returncode != 0:
         log = (
             "Chocolatey installation failed. "
@@ -592,13 +583,13 @@ def install_with_winget(package_id: str) -> tuple[bool, str, str]:
         f'winget install --id "{package_id}" '
         "--accept-package-agreements --accept-source-agreements"
     )
-    proc = run_powershell(command)
+    proc = run_powershell(command, timeout=300)
     return proc.returncode == 0, proc.stdout, proc.stderr
 
 
 def install_with_choco(package_id: str) -> tuple[bool, str, str]:
     command = f'choco install "{package_id}" -y'
-    proc = run_powershell(command)
+    proc = run_powershell(command, timeout=300)
     return proc.returncode == 0, proc.stdout, proc.stderr
 
 
@@ -607,13 +598,13 @@ def uninstall_with_winget(package_id: str) -> tuple[bool, str, str]:
         f'winget uninstall --id "{package_id}" '
         "--accept-package-agreements --accept-source-agreements"
     )
-    proc = run_powershell(command)
+    proc = run_powershell(command, timeout=300)
     return proc.returncode == 0, proc.stdout, proc.stderr
 
 
 def uninstall_with_choco(package_id: str) -> tuple[bool, str, str]:
     command = f'choco uninstall \"{package_id}\" -y'
-    proc = run_powershell(command)
+    proc = run_powershell(command, timeout=300)
     return proc.returncode == 0, proc.stdout, proc.stderr
 
 
@@ -810,8 +801,10 @@ def run_defender_scan_impl(payload: DefenderScanRequest) -> DefenderScanResponse
 
     if payload.scan_type == "quick":
         cmd = "Start-MpScan -ScanType QuickScan"
+        scan_timeout = 1800  # quick scans can take up to 30 minutes
     elif payload.scan_type == "full":
         cmd = "Start-MpScan -ScanType FullScan"
+        scan_timeout = 14400  # full scans can take hours
     else:
         if not payload.path:
             raise HTTPException(
@@ -821,8 +814,9 @@ def run_defender_scan_impl(payload: DefenderScanRequest) -> DefenderScanResponse
         # Basic escaping of double quotes
         scan_path = payload.path.replace('"', '\"')
         cmd = f'Start-MpScan -ScanPath "{scan_path}"'
+        scan_timeout = 3600  # path scans up to 1 hour
 
-    proc = run_powershell(cmd)
+    proc = run_powershell(cmd, timeout=scan_timeout)
 
     success = proc.returncode == 0
     log_parts.append(
@@ -853,7 +847,7 @@ def list_processes_impl() -> ListProcessesResponse:
     return ListProcessesResponse(
         success=proc.returncode == 0,
         processes=processes,
-        raw={"stdout": proc.stdout, "stderr": proc.stderr, "errors": errors},
+        raw={"errors": errors},
         log=" | ".join(log_parts),
     )
 
@@ -901,7 +895,7 @@ def list_services_impl() -> ListServicesResponse:
     return ListServicesResponse(
         success=proc.returncode == 0,
         services=services,
-        raw={"stdout": proc.stdout, "stderr": proc.stderr, "errors": errors},
+        raw={"errors": errors},
         log=" | ".join(log_parts),
     )
 
@@ -938,13 +932,32 @@ def diagnose_performance_impl() -> DiagnosePerformanceResponse:
     errors: list[str] = []
     log_parts: list[str] = []
 
-    # Disk usage
     disk_cmd = (
         "Get-PSDrive -PSProvider FileSystem | "
         "Select-Object Name, Used, Free | ConvertTo-Json -Depth 3"
     )
-    disk_proc = run_powershell(disk_cmd)
+    top_cpu_cmd = (
+        "Get-Process | Sort-Object CPU -Descending | "
+        "Select-Object -First 10 Name, Id, CPU, WorkingSet "
+        "| ConvertTo-Json -Depth 4"
+    )
+    top_mem_cmd = (
+        "Get-Process | Sort-Object WorkingSet -Descending | "
+        "Select-Object -First 10 Name, Id, CPU, WorkingSet "
+        "| ConvertTo-Json -Depth 4"
+    )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+        f_disk = ex.submit(run_powershell, disk_cmd)
+        f_cpu = ex.submit(run_powershell, top_cpu_cmd)
+        f_mem = ex.submit(run_powershell, top_mem_cmd)
+        disk_proc = f_disk.result()
+        top_cpu_proc = f_cpu.result()
+        top_mem_proc = f_mem.result()
+
     disks = safe_json_loads(disk_proc.stdout, "disks", errors)
+    top_cpu = safe_json_loads(top_cpu_proc.stdout, "top_cpu", errors)
+    top_memory = safe_json_loads(top_mem_proc.stdout, "top_memory", errors)
 
     low_disk_drives: list[dict[str, Any]] = []
     try:
@@ -956,7 +969,7 @@ def diagnose_performance_impl() -> DiagnosePerformanceResponse:
             free = d.get("Free") or 0
             total = used + free
             free_ratio = (free / total) if total else 0
-            if total and free_ratio < 0.1:  # less than 10% free
+            if total and free_ratio < 0.1:
                 low_disk_drives.append(
                     {
                         "name": d.get("Name"),
@@ -968,43 +981,15 @@ def diagnose_performance_impl() -> DiagnosePerformanceResponse:
     except Exception as exc:  # pragma: no cover - defensive
         errors.append(f"disk heuristic failed: {exc!r}")
 
-    # Top CPU processes
-    top_cpu_cmd = (
-        "Get-Process | Sort-Object CPU -Descending | "
-        "Select-Object -First 10 Name, Id, CPU, WorkingSet "
-        "| ConvertTo-Json -Depth 4"
-    )
-    top_cpu_proc = run_powershell(top_cpu_cmd)
-    top_cpu = safe_json_loads(top_cpu_proc.stdout, "top_cpu", errors)
-
-    # Top memory processes
-    top_mem_cmd = (
-        "Get-Process | Sort-Object WorkingSet -Descending | "
-        "Select-Object -First 10 Name, Id, CPU, WorkingSet "
-        "| ConvertTo-Json -Depth 4"
-    )
-    top_mem_proc = run_powershell(top_mem_cmd)
-    top_memory = safe_json_loads(top_mem_proc.stdout, "top_memory", errors)
-
     if errors:
         log_parts.extend(errors)
-
-    raw = {
-        "disks_stdout": disk_proc.stdout,
-        "disks_stderr": disk_proc.stderr,
-        "top_cpu_stdout": top_cpu_proc.stdout,
-        "top_cpu_stderr": top_cpu_proc.stderr,
-        "top_memory_stdout": top_mem_proc.stdout,
-        "top_memory_stderr": top_mem_proc.stderr,
-        "errors": errors,
-    }
 
     return DiagnosePerformanceResponse(
         success=len(errors) == 0,
         low_disk_drives=low_disk_drives,
         top_cpu=top_cpu,
         top_memory=top_memory,
-        raw=raw,
+        raw={},
         log=" | ".join(log_parts),
     )
 
@@ -1034,11 +1019,7 @@ def get_gpu_info_impl() -> GPUInfoResponse:
     return GPUInfoResponse(
         success=proc.returncode == 0 and not errors,
         gpus=gpus,
-        raw={
-            "stdout": proc.stdout,
-            "stderr": proc.stderr,
-            "errors": errors,
-        },
+        raw={},
         log=" | ".join(log_parts),
     )
 
@@ -1118,21 +1099,21 @@ def download_file_impl(payload: DownloadFileRequest) -> DownloadFileResponse:
 def full_system_health_check_impl() -> FullHealthCheckResponse:
     log_parts: list[str] = []
 
-    # System overview
-    system_overview = get_system_overview_impl()
+    recent_req = EventLogsRequest(
+        log_name="Application", level="Error", minutes=60, max_events=10
+    )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+        f_overview = ex.submit(get_system_overview_impl)
+        f_network = ex.submit(diagnose_network_issue_impl)
+        f_errors = ex.submit(get_recent_event_logs_impl, recent_req)
+        system_overview = f_overview.result()
+        network = f_network.result()
+        recent_errors = f_errors.result()
+
     if system_overview.get("errors"):
         log_parts.append("System overview reported errors.")
-
-    # Network
-    network = diagnose_network_issue_impl()
     if not network.success:
         log_parts.append("Network diagnostics reported errors.")
-
-    # Recent error logs (last 60 minutes, Application errors)
-    recent_req = EventLogsRequest(
-        log_name="Application", level="Error", minutes=60, max_events=50
-    )
-    recent_errors = get_recent_event_logs_impl(recent_req)
     if recent_errors.get("errors"):
         log_parts.append("Event log retrieval reported errors.")
 
