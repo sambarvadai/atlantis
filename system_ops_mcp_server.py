@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Dict, List, Tuple
+import json as _json
+import os
+from typing import Any, Dict, List, Optional, Tuple
 
+import httpx
 import mcp.types as mcp_types
 from mcp.server import Server as MCPServer
 from mcp.server.lowlevel.server import NotificationOptions
@@ -10,6 +13,75 @@ from mcp.server.streamable_http import StreamableHTTPServerTransport
 from starlette.responses import PlainTextResponse
 
 import system_ops_server as ops
+
+_FRONTEND_URL: Optional[str] = os.getenv("FRONTEND_INTERNAL_URL")
+
+_TOOL_STEPS: Dict[str, str] = {
+    "get_system_overview": "Gathering system overview…",
+    "get_gpu_info": "Detecting GPU information…",
+    "diagnose_network_issue": "Running network diagnostics…",
+    "diagnose_performance": "Analyzing system performance…",
+    "get_recent_event_logs": "Reading event logs…",
+    "full_system_health_check": "Running full health check…",
+    "install_app": "Installing application…",
+    "uninstall_app": "Uninstalling application…",
+    "run_defender_scan": "Starting antivirus scan…",
+    "download_file": "Downloading file…",
+    "list_processes": "Listing running processes…",
+    "kill_process": "Terminating process…",
+    "list_services": "Listing services…",
+    "control_service": "Controlling service…",
+    "execute_powershell_commands": "Executing commands…",
+}
+
+
+async def _poll_scan_progress(scan_type: str) -> None:
+    """Push live Defender scan status updates to the frontend every 5 seconds."""
+    if not _FRONTEND_URL:
+        return
+    in_progress_key = "QuickScanInProgress" if scan_type == "quick" else "FullScanInProgress"
+    loop = asyncio.get_running_loop()
+
+    for _ in range(180):  # max 15 minutes
+        await asyncio.sleep(5)
+        try:
+            proc = await loop.run_in_executor(
+                None,
+                lambda: ops.run_powershell(
+                    "Get-MpComputerStatus | Select-Object QuickScanInProgress, FullScanInProgress | ConvertTo-Json",
+                    timeout=10,
+                ),
+            )
+            status = _json.loads(proc.stdout) if proc.stdout.strip() else {}
+            in_progress = bool(status.get(in_progress_key, False))
+            step = (
+                f"Antivirus {scan_type} scan in progress…"
+                if in_progress
+                else f"Antivirus {scan_type} scan complete ✓"
+            )
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                await client.post(
+                    f"{_FRONTEND_URL}/internal/tool-event",
+                    json={"tool": "run_defender_scan", "step": step},
+                )
+            if not in_progress:
+                break
+        except Exception:
+            break
+
+
+async def _notify_frontend(tool_name: str) -> None:
+    if not _FRONTEND_URL:
+        return
+    step = _TOOL_STEPS.get(tool_name, f"Running {tool_name}…")
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            await client.post(
+                f"{_FRONTEND_URL}/internal/tool-event",
+                json={"tool": tool_name, "step": step},
+            )
+    except Exception:
+        pass
 
 
 #
@@ -204,12 +276,14 @@ async def list_tools() -> List[mcp_types.Tool]:
     return tools
 
 
-_STDOUT_MAX = 3000
-_STDERR_MAX = 500
+_STDOUT_MAX = 2000
+_STDERR_MAX = 300
+_MESSAGE_MAX = 300
+_LIST_MAX = 40
 
 
 def _truncate_outputs(d: Any) -> Any:
-    """Recursively truncate stdout/stderr strings to keep LLM token usage low."""
+    """Recursively truncate large strings and lists to keep LLM token usage low."""
     if isinstance(d, dict):
         out = {}
         for k, v in d.items():
@@ -217,10 +291,16 @@ def _truncate_outputs(d: Any) -> Any:
                 out[k] = v[:_STDOUT_MAX] + f"\n…[truncated, {len(v) - _STDOUT_MAX} chars omitted]"
             elif k == "stderr" and isinstance(v, str) and len(v) > _STDERR_MAX:
                 out[k] = v[:_STDERR_MAX] + f"\n…[truncated, {len(v) - _STDERR_MAX} chars omitted]"
+            elif k in ("Message", "message") and isinstance(v, str) and len(v) > _MESSAGE_MAX:
+                out[k] = v[:_MESSAGE_MAX] + "…"
             else:
                 out[k] = _truncate_outputs(v)
         return out
     if isinstance(d, list):
+        if len(d) > _LIST_MAX:
+            items = [_truncate_outputs(item) for item in d[:_LIST_MAX]]
+            items.append({"_note": f"{len(d) - _LIST_MAX} more items omitted"})
+            return items
         return [_truncate_outputs(item) for item in d]
     return d
 
@@ -230,6 +310,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
     """
     Dispatch MCP tool calls to the underlying system_ops implementations.
     """
+    await _notify_frontend(name)
 
     # Helper to normalize pydantic models to plain dicts and truncate verbose fields
     def _to_dict(value: Any) -> Dict[str, Any]:
@@ -270,7 +351,9 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
 
     if name == "run_defender_scan":
         payload = ops.DefenderScanRequest(**arguments)
-        return _to_dict(ops.run_defender_scan_impl(payload))
+        result = _to_dict(ops.run_defender_scan_impl(payload))
+        asyncio.create_task(_poll_scan_progress(arguments.get("scan_type", "quick")))
+        return result
 
     if name == "download_file":
         payload = ops.DownloadFileRequest(**arguments)

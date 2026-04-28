@@ -54,6 +54,9 @@ venv.bak/
 [._]sw[a-p]
 *~
 
+# ChromaDB persistent store (local user data)
+data/
+
 # Logs
 logs/
 *.log

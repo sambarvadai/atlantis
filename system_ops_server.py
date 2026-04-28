@@ -214,7 +214,7 @@ class EventLogsRequest(BaseModel):
     log_name: str = "Application"
     level: Optional[Literal["Error", "Warning", "Information"]] = None
     minutes: int = 60
-    max_events: int = 50
+    max_events: int = 15
 
 
 def get_recent_event_logs_impl(payload: EventLogsRequest) -> dict:
@@ -797,46 +797,67 @@ def run_defender_scan_impl(payload: DefenderScanRequest) -> DefenderScanResponse
             detail="Defender scan not confirmed. Set confirmed=true to proceed.",
         )
 
-    log_parts: list[str] = []
-
+    # Start-MpScan blocks until the scan finishes (5-15 min for quick, hours for
+    # full) which exceeds the MCP read timeout. Run it as a background PS job so
+    # this tool returns in seconds; Defender completes the scan independently.
     if payload.scan_type == "quick":
-        cmd = "Start-MpScan -ScanType QuickScan"
-        scan_timeout = 1800  # quick scans can take up to 30 minutes
+        job_block = "Start-MpScan -ScanType QuickScan"
+        job_args = ""
     elif payload.scan_type == "full":
-        cmd = "Start-MpScan -ScanType FullScan"
-        scan_timeout = 14400  # full scans can take hours
+        job_block = "Start-MpScan -ScanType FullScan"
+        job_args = ""
     else:
         if not payload.path:
             raise HTTPException(
                 status_code=400,
                 detail="Path scan requested but no path provided.",
             )
-        # Basic escaping of double quotes
-        scan_path = payload.path.replace('"', '\"')
-        cmd = f'Start-MpScan -ScanPath "{scan_path}"'
-        scan_timeout = 3600  # path scans up to 1 hour
+        safe_path = payload.path.replace("'", "''")
+        job_block = "param($p) Start-MpScan -ScanPath $p"
+        job_args = f" -ArgumentList '{safe_path}'"
 
-    proc = run_powershell(cmd, timeout=scan_timeout)
+    status_cmd = (
+        "Get-MpComputerStatus | "
+        "Select-Object AntivirusEnabled, RealTimeProtectionEnabled, "
+        "QuickScanInProgress, FullScanInProgress | ConvertTo-Json"
+    )
+    cmd = (
+        f"Start-Job -ScriptBlock {{ {job_block} }}{job_args} | Out-Null; "
+        f"{status_cmd}"
+    )
+    proc = run_powershell(cmd, timeout=30)
 
     success = proc.returncode == 0
-    log_parts.append(
-        f"Defender scan command executed with returncode={proc.returncode}."
-    )
+    stdout = ("Scan initiated in background.\n" + proc.stdout if success else proc.stdout)
 
     return DefenderScanResponse(
         success=success,
         scan_type=payload.scan_type,
         path=payload.path,
-        stdout=proc.stdout,
+        stdout=stdout,
         stderr=proc.stderr,
-        log=" | ".join(log_parts),
+        log=f"Defender scan job submitted with returncode={proc.returncode}.",
     )
+
+
+def get_defender_status_impl() -> dict:
+    cmd = (
+        "Get-MpComputerStatus | Select-Object "
+        "QuickScanInProgress, FullScanInProgress, "
+        "QuickScanAge, FullScanAge, RealTimeProtectionEnabled | ConvertTo-Json"
+    )
+    proc = run_powershell(cmd, timeout=10)
+    errors: list[str] = []
+    status = safe_json_loads(proc.stdout, "defender_status", errors)
+    return {"success": proc.returncode == 0 and not errors, "status": status, "errors": errors}
 
 
 def list_processes_impl() -> ListProcessesResponse:
     cmd = (
-        "Get-Process | Select-Object Name, Id, CPU, WorkingSet, StartTime "
-        "-ErrorAction SilentlyContinue | ConvertTo-Json -Depth 4"
+        "Get-Process -ErrorAction SilentlyContinue | "
+        "Sort-Object CPU -Descending | "
+        "Select-Object -First 30 Name, Id, CPU, WorkingSet "
+        "| ConvertTo-Json -Depth 4"
     )
     proc = run_powershell(cmd)
     errors: list[str] = []
@@ -883,7 +904,8 @@ def kill_process_impl(payload: KillProcessRequest) -> KillProcessResponse:
 
 def list_services_impl() -> ListServicesResponse:
     cmd = (
-        "Get-Service | Select-Object Name, DisplayName, Status "
+        "Get-Service | Where-Object { $_.Status -eq 'Running' } | "
+        "Select-Object Name, DisplayName, Status "
         "| ConvertTo-Json -Depth 4"
     )
     proc = run_powershell(cmd)
@@ -1176,11 +1198,26 @@ def execute_commands_impl(payload: ExecuteCommandsRequest) -> ExecuteCommandsRes
             f"exit_code={proc.returncode} command={spec.text!r}"
         )
 
-    # Append to a simple log file for auditing (best-effort; ignore failures)
+    # Append to the audit log
     try:
         with open("logs/system_ops_commands.log", "a", encoding="utf-8") as f:
             for line in log_lines:
                 f.write(line + "\n")
+    except Exception:
+        pass
+
+    # Append to the Atlantis session display log (tailed by the dedicated PS window)
+    try:
+        with open("logs/atlantis_session.log", "a", encoding="utf-8") as f:
+            for r in results:
+                f.write(f"\n{'-' * 60}\n")
+                f.write(f"[{timestamp}] [{r.origin}]\n")
+                f.write(f"$ {r.command}\n")
+                if r.stdout and r.stdout.strip():
+                    f.write(r.stdout.strip() + "\n")
+                if r.stderr and r.stderr.strip():
+                    f.write(f"[stderr] {r.stderr.strip()}\n")
+                f.write(f"[exit: {r.exit_code}]\n")
     except Exception:
         pass
 
@@ -1358,6 +1395,14 @@ def full_system_health_check() -> FullHealthCheckResponse:
     HTTP tool: run a one-shot health check combining overview, network, and recent logs.
     """
     return full_system_health_check_impl()
+
+
+@app.get("/tools/get_defender_status")
+def get_defender_status() -> dict:
+    """
+    HTTP tool: return current Windows Defender scan status (in-progress flags, scan ages).
+    """
+    return get_defender_status_impl()
 
 
 @app.post(

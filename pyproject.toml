@@ -10,4 +10,5 @@ dependencies = [
     "uvicorn>=0.30.0",
     "pymongo>=4.7.0",
     "python-dotenv>=1.0.1",
+    "chromadb>=1.5.8",
 ]

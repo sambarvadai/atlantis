@@ -10,6 +10,28 @@ import webbrowser
 from typing import List, Tuple
 
 
+def open_session_window(log_path: str) -> None:
+    """
+    Open a dedicated PowerShell console window that tails the Atlantis session
+    log in real time. The window stays open until the user closes it.
+    """
+    abs_path = os.path.abspath(log_path)
+    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+    if not os.path.exists(abs_path):
+        with open(abs_path, "w", encoding="utf-8") as f:
+            f.write(f"=== Atlantis Session Log — {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} ===\n\n")
+
+    safe = abs_path.replace("'", "''")
+    ps_cmd = (
+        f"$Host.UI.RawUI.WindowTitle = 'Atlantis — Session Commands'; "
+        f"Get-Content -Wait -Path '{safe}'"
+    )
+    subprocess.Popen(
+        ["powershell", "-NoProfile", "-NoExit", "-Command", ps_cmd],
+        creationflags=subprocess.CREATE_NEW_CONSOLE,
+    )
+
+
 def find_free_port(preferred: int, host: str = "127.0.0.1") -> int:
     """
     Find an available TCP port on the given host, preferring the provided port
@@ -89,6 +111,7 @@ def main() -> None:
 
     os.environ["SYSTEM_OPS_PORT"] = str(system_ops_port)
     os.environ["SYSTEM_OPS_BASE_URL"] = f"http://127.0.0.1:{system_ops_port}"
+    os.environ["FRONTEND_INTERNAL_URL"] = f"http://127.0.0.1:{frontend_port}"
 
     # Ensure mcp_agent.config.yaml points system_ops at the chosen MCP port.
     update_mcp_config_system_ops_url(system_ops_mcp_port)
@@ -140,8 +163,9 @@ def main() -> None:
                 )
                 raise RuntimeError("One of the servers failed to start.")
 
-        # Give servers a moment to bind, then open the browser
+        # Give servers a moment to bind, then open the session window and browser
         time.sleep(2.0)
+        open_session_window("logs/atlantis_session.log")
         try:
             url = f"http://127.0.0.1:{frontend_port}/"
             webbrowser.open(url)
